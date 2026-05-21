@@ -20,7 +20,6 @@
 
 #include <fluent-bit.h>
 #include <fluent-bit/flb_sds.h>
-#include <fluent-bit/flb_http_client.h>
 #include <fluent-bit/flb_time.h>
 #include <fluent-bit/flb_http_server.h>
 #include <fluent-bit/flb_downstream.h>
@@ -32,6 +31,7 @@
 
 #define DPATH_LOKI FLB_TESTS_DATA_PATH "/data/loki"
 #define LOKI_TENANT_POLICY_HOST "127.0.0.1"
+#define LOKI_TENANT_SPLIT_PORT "18083"
 #define LOKI_TENANT_POLICY_SUCCESS_PORT "18084"
 #define LOKI_TENANT_POLICY_ERROR_PORT "18085"
 
@@ -43,6 +43,7 @@ static int tenant_request_count = 0;
 static int tenant_policy_request_count = 0;
 static int tenant_policy_a_count = 0;
 static int tenant_policy_b_count = 0;
+static int tenant_policy_fail_tenant_a = FLB_FALSE;
 
 struct tenant_policy_server {
     struct flb_http_server server;
@@ -105,33 +106,6 @@ static void clear_tenant_requests()
     pthread_mutex_unlock(&result_mutex);
 }
 
-static void cb_loki_debug_headers(char *name, void *p1, void *p2)
-{
-    struct flb_http_client *c = p1;
-    int slot;
-
-    pthread_mutex_lock(&result_mutex);
-    slot = tenant_request_count;
-    if (slot < 4 && c->header_buf) {
-        tenant_headers[slot] = flb_sds_create_len(c->header_buf, c->header_len);
-    }
-    pthread_mutex_unlock(&result_mutex);
-}
-
-static void cb_loki_debug_payload(char *name, void *p1, void *p2)
-{
-    struct flb_http_client *c = p1;
-    int slot;
-
-    pthread_mutex_lock(&result_mutex);
-    slot = tenant_request_count;
-    if (slot < 4 && c->body_buf) {
-        tenant_payloads[slot] = flb_sds_create_len(c->body_buf, c->body_len);
-    }
-    tenant_request_count++;
-    pthread_mutex_unlock(&result_mutex);
-}
-
 static int get_tenant_request_count()
 {
     int ret;
@@ -149,6 +123,7 @@ static void clear_tenant_policy_requests()
     tenant_policy_request_count = 0;
     tenant_policy_a_count = 0;
     tenant_policy_b_count = 0;
+    tenant_policy_fail_tenant_a = FLB_FALSE;
     pthread_mutex_unlock(&result_mutex);
 }
 
@@ -185,19 +160,48 @@ static int get_tenant_policy_b_count()
     return ret;
 }
 
+static void set_tenant_policy_fail_tenant_a(int fail)
+{
+    pthread_mutex_lock(&result_mutex);
+    tenant_policy_fail_tenant_a = fail;
+    pthread_mutex_unlock(&result_mutex);
+}
+
 static int cb_loki_tenant_policy_server(struct flb_http_request *request,
                                         struct flb_http_response *response)
 {
     int status = 200;
+    int slot;
+    int fail_tenant_a;
     char *tenant;
 
     tenant = flb_http_request_get_header(request, "x-scope-orgid");
 
     pthread_mutex_lock(&result_mutex);
+    slot = tenant_request_count;
+    if (slot < 4) {
+        if (tenant != NULL) {
+            tenant_headers[slot] = flb_sds_create("X-Scope-OrgID: ");
+            if (tenant_headers[slot] != NULL) {
+                tenant_headers[slot] = flb_sds_cat(tenant_headers[slot],
+                                                   tenant, strlen(tenant));
+            }
+        }
+
+        if (request->body != NULL) {
+            tenant_payloads[slot] = flb_sds_create_len(request->body,
+                                                       cfl_sds_len(request->body));
+        }
+        tenant_request_count++;
+    }
+
     tenant_policy_request_count++;
+    fail_tenant_a = tenant_policy_fail_tenant_a;
     if (tenant != NULL && strcmp(tenant, "tenant-a") == 0) {
         tenant_policy_a_count++;
-        status = 400;
+        if (fail_tenant_a == FLB_TRUE) {
+            status = 400;
+        }
     }
     else if (tenant != NULL && strcmp(tenant, "tenant-b") == 0) {
         tenant_policy_b_count++;
@@ -998,14 +1002,14 @@ void flb_test_tenant_id_key_splits_requests()
     int ret;
     int tries;
     int in_ffd;
-    int http_ffd;
     int out_ffd;
-    int null_ffd;
     flb_ctx_t *ctx;
+    struct tenant_policy_server mock_server;
     char *tenant_a = "[12345678, {\"tenant_id\":\"tenant-a\",\"msg\":\"msg-a\"}]";
     char *tenant_b = "[12345679, {\"tenant_id\":\"tenant-b\",\"msg\":\"msg-b\"}]";
 
     clear_tenant_requests();
+    clear_tenant_policy_requests();
 
     ctx = flb_create();
     flb_service_set(ctx, "flush", "1", "grace", "1",
@@ -1016,39 +1020,23 @@ void flb_test_tenant_id_key_splits_requests()
     TEST_CHECK(in_ffd >= 0);
     flb_input_set(ctx, in_ffd, "tag", "test", NULL);
 
-    http_ffd = flb_input(ctx, (char *) "http", NULL);
-    TEST_CHECK(http_ffd >= 0);
-    ret = flb_input_set(ctx, http_ffd,
-                        "host", "127.0.0.1",
-                        "port", "18083",
-                        "tag", "loki_in",
-                        NULL);
-    TEST_CHECK(ret == 0);
-
-    null_ffd = flb_output(ctx, (char *) "null", NULL);
-    TEST_CHECK(null_ffd >= 0);
-    ret = flb_output_set(ctx, null_ffd, "match", "loki_in", NULL);
-    TEST_CHECK(ret == 0);
-
     out_ffd = flb_output(ctx, (char *) "loki", NULL);
     TEST_CHECK(out_ffd >= 0);
     ret = flb_output_set(ctx, out_ffd,
                          "match", "test",
-                         "host", "127.0.0.1",
-                         "port", "18083",
+                         "host", LOKI_TENANT_POLICY_HOST,
+                         "port", LOKI_TENANT_SPLIT_PORT,
                          "tenant_id_key", "tenant_id",
                          "remove_keys", "tenant_id",
+                         "net.keepalive", "off",
                          NULL);
     TEST_CHECK(ret == 0);
 
-    ret = flb_output_set_callback(ctx, out_ffd, "_debug.http.request_headers",
-                                  cb_loki_debug_headers);
-    TEST_CHECK(ret >= 0);
-    ret = flb_output_set_callback(ctx, out_ffd, "_debug.http.request_payload",
-                                  cb_loki_debug_payload);
-    TEST_CHECK(ret >= 0);
-
     ret = flb_start(ctx);
+    TEST_CHECK(ret == 0);
+
+    ret = start_tenant_policy_server(&mock_server, LOKI_TENANT_SPLIT_PORT,
+                                     ctx->config);
     TEST_CHECK(ret == 0);
 
     ret = flb_lib_push(ctx, in_ffd, tenant_a, strlen(tenant_a));
@@ -1070,8 +1058,10 @@ void flb_test_tenant_id_key_splits_requests()
     pthread_mutex_unlock(&result_mutex);
 
     flb_stop(ctx);
+    stop_tenant_policy_server(&mock_server);
     flb_destroy(ctx);
     clear_tenant_requests();
+    clear_tenant_policy_requests();
 }
 
 static void run_tenant_id_key_partial_handling(char *mode,
@@ -1087,7 +1077,9 @@ static void run_tenant_id_key_partial_handling(char *mode,
     char *tenant_a = "[12345678, {\"tenant_id\":\"tenant-a\",\"msg\":\"msg-a\"}]";
     char *tenant_b = "[12345679, {\"tenant_id\":\"tenant-b\",\"msg\":\"msg-b\"}]";
 
+    clear_tenant_requests();
     clear_tenant_policy_requests();
+    set_tenant_policy_fail_tenant_a(FLB_TRUE);
 
     ctx = flb_create();
     flb_service_set(ctx, "flush", "1", "grace", "1",
@@ -1178,6 +1170,7 @@ static void run_tenant_id_key_partial_handling(char *mode,
     flb_stop(ctx);
     stop_tenant_policy_server(&mock_server);
     flb_destroy(ctx);
+    clear_tenant_requests();
     clear_tenant_policy_requests();
 }
 
