@@ -20,12 +20,18 @@
 
 #include <fluent-bit.h>
 #include <fluent-bit/flb_sds.h>
+#include <fluent-bit/flb_http_client.h>
+#include <fluent-bit/flb_time.h>
 #include "flb_tests_runtime.h"
 
 #define DPATH_LOKI FLB_TESTS_DATA_PATH "/data/loki"
 
 pthread_mutex_t result_mutex = PTHREAD_MUTEX_INITIALIZER;
 int num_output = 0;
+static flb_sds_t tenant_headers[4];
+static flb_sds_t tenant_payloads[4];
+static int tenant_request_count = 0;
+
 static int get_output_num()
 {
     int ret;
@@ -46,6 +52,63 @@ static void set_output_num(int num)
 static void clear_output_num()
 {
     set_output_num(0);
+}
+
+static void clear_tenant_requests()
+{
+    int i;
+
+    pthread_mutex_lock(&result_mutex);
+    for (i = 0; i < 4; i++) {
+        if (tenant_headers[i]) {
+            flb_sds_destroy(tenant_headers[i]);
+            tenant_headers[i] = NULL;
+        }
+        if (tenant_payloads[i]) {
+            flb_sds_destroy(tenant_payloads[i]);
+            tenant_payloads[i] = NULL;
+        }
+    }
+    tenant_request_count = 0;
+    pthread_mutex_unlock(&result_mutex);
+}
+
+static void cb_loki_debug_headers(char *name, void *p1, void *p2)
+{
+    struct flb_http_client *c = p1;
+    int slot;
+
+    pthread_mutex_lock(&result_mutex);
+    slot = tenant_request_count;
+    if (slot < 4 && c->header_buf) {
+        tenant_headers[slot] = flb_sds_create_len(c->header_buf, c->header_len);
+    }
+    pthread_mutex_unlock(&result_mutex);
+}
+
+static void cb_loki_debug_payload(char *name, void *p1, void *p2)
+{
+    struct flb_http_client *c = p1;
+    int slot;
+
+    pthread_mutex_lock(&result_mutex);
+    slot = tenant_request_count;
+    if (slot < 4 && c->body_buf) {
+        tenant_payloads[slot] = flb_sds_create_len(c->body_buf, c->body_len);
+    }
+    tenant_request_count++;
+    pthread_mutex_unlock(&result_mutex);
+}
+
+static int get_tenant_request_count()
+{
+    int ret;
+
+    pthread_mutex_lock(&result_mutex);
+    ret = tenant_request_count;
+    pthread_mutex_unlock(&result_mutex);
+
+    return ret;
 }
 
 #define JSON_BASIC "[12345678, {\"key\":\"value\"}]"
@@ -690,6 +753,121 @@ void flb_test_remove_keys_workers()
     flb_destroy(ctx);
 }
 
+static int check_tenant_request(char *tenant, char *present, char *absent)
+{
+    int i;
+
+    for (i = 0; i < tenant_request_count; i++) {
+        if (tenant_headers[i] == NULL || tenant_payloads[i] == NULL) {
+            continue;
+        }
+
+        if (strstr(tenant_headers[i], tenant) == NULL) {
+            continue;
+        }
+
+        if (!TEST_CHECK(strstr(tenant_payloads[i], present) != NULL)) {
+            TEST_MSG("payload for %s did not contain %s: %s",
+                     tenant, present, tenant_payloads[i]);
+            return -1;
+        }
+
+        if (!TEST_CHECK(strstr(tenant_payloads[i], absent) == NULL)) {
+            TEST_MSG("payload for %s contained %s: %s",
+                     tenant, absent, tenant_payloads[i]);
+            return -1;
+        }
+
+        return 0;
+    }
+
+    TEST_CHECK(0);
+    TEST_MSG("no request found for tenant %s", tenant);
+
+    return -1;
+}
+
+void flb_test_tenant_id_key_splits_requests()
+{
+    int ret;
+    int tries;
+    int in_ffd;
+    int http_ffd;
+    int out_ffd;
+    int null_ffd;
+    flb_ctx_t *ctx;
+    char *tenant_a = "[12345678, {\"tenant_id\":\"tenant-a\",\"msg\":\"msg-a\"}]";
+    char *tenant_b = "[12345679, {\"tenant_id\":\"tenant-b\",\"msg\":\"msg-b\"}]";
+
+    clear_tenant_requests();
+
+    ctx = flb_create();
+    flb_service_set(ctx, "flush", "1", "grace", "1",
+                    "log_level", "error",
+                    NULL);
+
+    in_ffd = flb_input(ctx, (char *) "lib", NULL);
+    TEST_CHECK(in_ffd >= 0);
+    flb_input_set(ctx, in_ffd, "tag", "test", NULL);
+
+    http_ffd = flb_input(ctx, (char *) "http", NULL);
+    TEST_CHECK(http_ffd >= 0);
+    ret = flb_input_set(ctx, http_ffd,
+                        "host", "127.0.0.1",
+                        "port", "18083",
+                        "tag", "loki_in",
+                        NULL);
+    TEST_CHECK(ret == 0);
+
+    null_ffd = flb_output(ctx, (char *) "null", NULL);
+    TEST_CHECK(null_ffd >= 0);
+    ret = flb_output_set(ctx, null_ffd, "match", "loki_in", NULL);
+    TEST_CHECK(ret == 0);
+
+    out_ffd = flb_output(ctx, (char *) "loki", NULL);
+    TEST_CHECK(out_ffd >= 0);
+    ret = flb_output_set(ctx, out_ffd,
+                         "match", "test",
+                         "host", "127.0.0.1",
+                         "port", "18083",
+                         "tenant_id_key", "tenant_id",
+                         "remove_keys", "tenant_id",
+                         NULL);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_output_set_callback(ctx, out_ffd, "_debug.http.request_headers",
+                                  cb_loki_debug_headers);
+    TEST_CHECK(ret >= 0);
+    ret = flb_output_set_callback(ctx, out_ffd, "_debug.http.request_payload",
+                                  cb_loki_debug_payload);
+    TEST_CHECK(ret >= 0);
+
+    ret = flb_start(ctx);
+    TEST_CHECK(ret == 0);
+
+    ret = flb_lib_push(ctx, in_ffd, tenant_a, strlen(tenant_a));
+    TEST_CHECK(ret >= 0);
+    ret = flb_lib_push(ctx, in_ffd, tenant_b, strlen(tenant_b));
+    TEST_CHECK(ret >= 0);
+
+    for (tries = 0; tries < 20 && get_tenant_request_count() < 2; tries++) {
+        flb_time_msleep(500);
+    }
+
+    if (!TEST_CHECK(get_tenant_request_count() == 2)) {
+        TEST_MSG("expected 2 requests, got %d", get_tenant_request_count());
+    }
+
+    pthread_mutex_lock(&result_mutex);
+    check_tenant_request("X-Scope-OrgID: tenant-a", "msg-a", "msg-b");
+    check_tenant_request("X-Scope-OrgID: tenant-b", "msg-b", "msg-a");
+    pthread_mutex_unlock(&result_mutex);
+
+    flb_stop(ctx);
+    flb_destroy(ctx);
+    clear_tenant_requests();
+}
+
 static void cb_check_label_map_path(void *ctx, int ffd,
                                     int res_ret, void *res_data, size_t res_size,
                                     void *data)
@@ -1019,6 +1197,7 @@ TEST_LIST = {
     {"labels_ra"              , flb_test_labels_ra },
     {"remove_keys"            , flb_test_remove_keys },
     {"remove_keys_workers"    , flb_test_remove_keys_workers },
+    {"tenant_id_key_splits_requests", flb_test_tenant_id_key_splits_requests },
     {"basic"                  , flb_test_basic },
     {"labels"                 , flb_test_labels },
     {"label_keys"             , flb_test_label_keys },
