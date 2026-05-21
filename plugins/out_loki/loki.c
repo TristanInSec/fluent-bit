@@ -41,6 +41,10 @@ struct flb_loki_tenant_group {
     struct mk_list _head;
 };
 
+#define FLB_LOKI_TENANT_GROUP_FLUSH_SUCCESS (((uint64_t) 1) << 0)
+#define FLB_LOKI_TENANT_GROUP_FLUSH_ERROR   (((uint64_t) 1) << 1)
+#define FLB_LOKI_TENANT_GROUP_FLUSH_RETRY   (((uint64_t) 1) << 2)
+
 pthread_once_t initialization_guard = PTHREAD_ONCE_INIT;
 
 struct flb_loki_remove_mpa_entry {
@@ -1195,6 +1199,22 @@ static struct flb_loki *loki_config_create(struct flb_output_instance *ins,
         return NULL;
     }
 
+    /* tenant_id_key split request error handling */
+    if (strcasecmp(ctx->tenant_id_key_error_handling, "partial_success") == 0) {
+        ctx->out_tenant_id_key_error_handling =
+            FLB_LOKI_TENANT_ID_KEY_ERROR_PARTIAL_SUCCESS;
+    }
+    else if (strcasecmp(ctx->tenant_id_key_error_handling, "partial_error") == 0) {
+        ctx->out_tenant_id_key_error_handling =
+            FLB_LOKI_TENANT_ID_KEY_ERROR_PARTIAL_ERROR;
+    }
+    else {
+        flb_plg_error(ctx->ins,
+                      "invalid 'tenant_id_key_error_handling' value: %s",
+                      ctx->tenant_id_key_error_handling);
+        return NULL;
+    }
+
     /* use TLS ? */
     if (ins->use_tls == FLB_TRUE) {
         io_flags = FLB_IO_TLS;
@@ -2062,6 +2082,45 @@ static int send_loki_payload(struct flb_loki *ctx,
     return out_ret;
 }
 
+static uint64_t tenant_group_flush_status(int ret)
+{
+    if (ret == FLB_OK) {
+        return FLB_LOKI_TENANT_GROUP_FLUSH_SUCCESS;
+    }
+    else if (ret == FLB_RETRY) {
+        return FLB_LOKI_TENANT_GROUP_FLUSH_RETRY;
+    }
+
+    return FLB_LOKI_TENANT_GROUP_FLUSH_ERROR;
+}
+
+static int tenant_group_flush_result(struct flb_loki *ctx, uint64_t status)
+{
+    if (status == 0) {
+        return FLB_OK;
+    }
+
+    if ((status & FLB_LOKI_TENANT_GROUP_FLUSH_SUCCESS) == 0) {
+        if (status & FLB_LOKI_TENANT_GROUP_FLUSH_RETRY) {
+            return FLB_RETRY;
+        }
+
+        return FLB_ERROR;
+    }
+
+    if ((status & FLB_LOKI_TENANT_GROUP_FLUSH_RETRY) == 0 &&
+        (status & FLB_LOKI_TENANT_GROUP_FLUSH_ERROR) == 0) {
+        return FLB_OK;
+    }
+
+    if (ctx->out_tenant_id_key_error_handling ==
+        FLB_LOKI_TENANT_ID_KEY_ERROR_PARTIAL_SUCCESS) {
+        return FLB_OK;
+    }
+
+    return FLB_RETRY;
+}
+
 static void cb_loki_flush(struct flb_event_chunk *event_chunk,
                           struct flb_output_flush *out_flush,
                           struct flb_input_instance *i_ins,
@@ -2070,6 +2129,7 @@ static void cb_loki_flush(struct flb_event_chunk *event_chunk,
 {
     int ret;
     int out_ret = FLB_OK;
+    uint64_t tenant_group_status = 0;
     flb_sds_t payload = NULL;
     struct flb_loki *ctx = out_context;
     struct flb_loki_remove_mpa_entry *remove_mpa_entry;
@@ -2139,16 +2199,15 @@ static void cb_loki_flush(struct flb_event_chunk *event_chunk,
 
         if (!payload) {
             flb_plg_error(ctx->ins, "cannot compose request payload");
-            out_ret = FLB_RETRY;
-            break;
+            tenant_group_status |= FLB_LOKI_TENANT_GROUP_FLUSH_RETRY;
+            continue;
         }
 
         ret = send_loki_payload(ctx, payload, group->tenant_id, config);
-        if (ret != FLB_OK) {
-            out_ret = ret;
-            break;
-        }
+        tenant_group_status |= tenant_group_flush_status(ret);
     }
+
+    out_ret = tenant_group_flush_result(ctx, tenant_group_status);
 
     tenant_groups_destroy(&tenant_groups);
 
@@ -2210,6 +2269,14 @@ static struct flb_config_map config_map[] = {
      0, FLB_TRUE, offsetof(struct flb_loki, tenant_id_key_config),
      "If set, X-Scope-OrgID will be the value of the key from incoming record. "
      "It is useful to set X-Scode-OrgID dynamically."
+    },
+
+    {
+     FLB_CONFIG_MAP_STR, "tenant_id_key_error_handling", "partial_success",
+     0, FLB_TRUE, offsetof(struct flb_loki, tenant_id_key_error_handling),
+     "Set how tenant_id_key split request failures affect the whole chunk. "
+     "Options are 'partial_success' to treat mixed success and failure as "
+     "success, or 'partial_error' to retry mixed success and failure."
     },
 
     {
