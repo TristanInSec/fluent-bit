@@ -49,8 +49,20 @@ struct tenant_policy_server {
     struct flb_net_setup net_setup;
     struct mk_event_loop *event_loop;
     pthread_t thread;
+    int thread_started;
     int stop;
 };
+
+static int tenant_policy_server_should_stop(struct tenant_policy_server *mock)
+{
+    int stop;
+
+    pthread_mutex_lock(&result_mutex);
+    stop = mock->stop;
+    pthread_mutex_unlock(&result_mutex);
+
+    return stop;
+}
 
 static int get_output_num()
 {
@@ -210,7 +222,7 @@ static void *tenant_policy_server_loop(void *data)
 
     flb_engine_evl_set(mock->event_loop);
 
-    while (mock->stop == FLB_FALSE) {
+    while (tenant_policy_server_should_stop(mock) == FLB_FALSE) {
         mk_event_wait_2(mock->event_loop, 100);
 
         mk_event_foreach(event, mock->event_loop) {
@@ -270,6 +282,7 @@ static int start_tenant_policy_server(struct tenant_policy_server *mock,
     }
 
     mock->stop = FLB_FALSE;
+    mock->thread_started = FLB_FALSE;
     ret = pthread_create(&mock->thread, NULL, tenant_policy_server_loop, mock);
     if (ret != 0) {
         flb_http_server_stop(&mock->server);
@@ -278,6 +291,7 @@ static int start_tenant_policy_server(struct tenant_policy_server *mock,
         mock->event_loop = NULL;
         return -1;
     }
+    mock->thread_started = FLB_TRUE;
 
     flb_time_msleep(500);
 
@@ -286,8 +300,17 @@ static int start_tenant_policy_server(struct tenant_policy_server *mock,
 
 static void stop_tenant_policy_server(struct tenant_policy_server *mock)
 {
+    if (mock->event_loop == NULL) {
+        return;
+    }
+
+    pthread_mutex_lock(&result_mutex);
     mock->stop = FLB_TRUE;
-    pthread_join(mock->thread, NULL);
+    pthread_mutex_unlock(&result_mutex);
+
+    if (mock->thread_started == FLB_TRUE) {
+        pthread_join(mock->thread, NULL);
+    }
     flb_http_server_stop(&mock->server);
     flb_http_server_destroy(&mock->server);
     mk_event_loop_destroy(mock->event_loop);
@@ -1069,6 +1092,8 @@ static void run_tenant_id_key_partial_handling(char *mode,
     ctx = flb_create();
     flb_service_set(ctx, "flush", "1", "grace", "1",
                     "log_level", "error",
+                    "scheduler.base", "1",
+                    "scheduler.cap", "1",
                     NULL);
 
     in_ffd = flb_input(ctx, (char *) "lib", NULL);
@@ -1142,7 +1167,7 @@ static void run_tenant_id_key_partial_handling(char *mode,
         }
     }
     else {
-        flb_time_msleep(2500);
+        flb_time_msleep(2500);  /* > one retry window with scheduler.base/cap = 1 */
 
         if (!TEST_CHECK(get_tenant_policy_request_count() == 2)) {
             TEST_MSG("expected no retry requests, got %d",
