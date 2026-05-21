@@ -97,9 +97,6 @@ struct flb_loki {
     struct flb_mp_accessor *remove_mpa;      /* remove_keys multi-pattern accessor */
     struct flb_record_accessor *ra_tenant_id_key;         /* dynamic tenant id key */
 
-    struct cfl_list dynamic_tenant_list;
-    pthread_mutex_t dynamic_tenant_list_lock;
-
     struct cfl_list remove_mpa_list;
     pthread_mutex_t remove_mpa_list_lock;
 
